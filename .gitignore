@@ -1,0 +1,7 @@
+*.pdx/
+*.pdx
+*.pdz
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
