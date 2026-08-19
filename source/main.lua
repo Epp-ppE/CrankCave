@@ -33,11 +33,11 @@ local SCREEN_H <const> = 240
 local testMap <const> = {
     "#########",
     "#.......#",
-    "#.#.#.#.#",
-    "#.......#",
-    "#.#.#.#.#",
-    "#.......#",
-    "#.#.#.#.#",
+    "#.#.###.#",
+    "#.#.#...#",
+    "#.#.###.#",
+    "#.#.....#",
+    "#.#.###.#",
     "#.......#",
     "#########",
 }
@@ -158,22 +158,27 @@ local function continuousDepthAt(d)
     return (cx - camTileX) * player.facingDX + (cy - camTileY) * player.facingDY
 end
 
--- Sets the fill color/dither for a wall surface at a given depth,
--- combining the charge tier's brightness (Light.getDither(), unchanged
--- from the old radial-light code) with distance falloff -- near surfaces
--- render dense/solid, far surfaces fade toward black. This replaces the
--- flat-density disc from the old top-down renderer with an actual
--- distance-based gradient, using the same tier data as before.
-local function setWallDither(depth)
+-- Sets the fill color/dither for a surface at a given depth, combining
+-- THREE things into one continuous 0..1 brightness before a single
+-- setDitherPattern call: the charge tier's brightness, distance falloff
+-- (near surfaces dense/solid, far surfaces fade toward black), and the
+-- surface's own material (Config.materials) -- its intrinsic "color",
+-- invisible in the dark, revealed and shaded once light reaches it. This
+-- order matters: combining as real numbers first and dithering once
+-- avoids double-quantizing two already-dithered patterns together, which
+-- looks muddy.
+local function setSurfaceDither(depth, material)
     local viewDist = Light.getViewDistance()
     local falloff = math.max(0, 1 - depth / viewDist)
-    local brightness = Light.getDither() * falloff
+    local brightness = Light.getDither() * falloff * material.dither
     gfx.setColor(gfx.kColorWhite)
-    -- setDitherPattern's parameter is a DIRECT grayscale value (0 =
-    -- black, 1 = white, per the SDK docs) -- not an alpha needing
-    -- inversion. brightness already runs 0 (dark) to 1 (bright) the
-    -- same direction, so it passes straight through.
-    gfx.setDitherPattern(brightness, gfx.image.kDitherTypeBayer8x8)
+    -- setDitherPattern's parameter is ALPHA relative to the current fill
+    -- color (white): 0 = fully opaque (solid white), 1 = fully
+    -- transparent (background/black shows through). That's the OPPOSITE
+    -- direction from brightness, so it needs inverting -- confirmed by
+    -- testing: passing brightness straight through made higher charge
+    -- render DARKER, which is this bug.
+    gfx.setDitherPattern(1 - brightness, gfx.image.kDitherTypeBayer8x8)
 end
 
 local function drawCorridor()
@@ -191,25 +196,40 @@ local function drawCorridor()
         local rightWall = isWall(cx + player.rightDX, cy + player.rightDY)
         local ahead = isWall(cx, cy)
 
-        -- Floor/ceiling perspective guide at this depth -- always drawn,
-        -- undithered, so the tunnel reads clearly even in total darkness
-        -- once Light.getDither() is 0 (nothing else will be visible then
-        -- anyway, but this keeps the geometry legible while tuning).
-        gfx.setColor(gfx.kColorWhite)
-        gfx.drawRect(x, y, w, h)
+        -- Floor and ceiling -- a separate axis from left/right/ahead, so
+        -- always present at this depth regardless of what's blocked.
+        -- Drawn first so wall fills and the debug outline layer cleanly
+        -- on top. Ceiling reuses the floor material for now (no separate
+        -- Config.materials.ceiling yet -- split it out if they should
+        -- ever look different).
+        setSurfaceDither(depth - 0.5, Config.materials.floor)
+        gfx.fillPolygon(prevX, prevY + prevH, prevX + prevW, prevY + prevH, x + w, y + h, x, y + h)
+        setSurfaceDither(depth - 0.5, Config.materials.floor)
+        gfx.fillPolygon(prevX, prevY, prevX + prevW, prevY, x + w, y, x, y)
+
+        -- Floor/ceiling perspective guide at this depth -- ONLY while
+        -- there's some light. This used to be unconditional "so the
+        -- tunnel reads clearly while tuning," but that meant the corridor
+        -- outline was visible in solid white regardless of charge, which
+        -- reads as "the light is always on" -- dark needs to actually be
+        -- dark for the rest of the design to mean anything.
+        if Light.getDither() > 0 then
+            gfx.setColor(gfx.kColorWhite)
+            gfx.drawRect(x, y, w, h)
+        end
 
         if leftWall then
-            setWallDither(depth - 0.5)
+            setSurfaceDither(depth - 0.5, Config.materials.wall)
             gfx.fillPolygon(prevX, prevY, x, y, x, y + h, prevX, prevY + prevH)
         end
 
         if rightWall then
-            setWallDither(depth - 0.5)
+            setSurfaceDither(depth - 0.5, Config.materials.wall)
             gfx.fillPolygon(prevX + prevW, prevY, x + w, y, x + w, y + h, prevX + prevW, prevY + prevH)
         end
 
         if ahead then
-            setWallDither(depth)
+            setSurfaceDither(depth, Config.materials.wall)
             gfx.fillRect(x, y, w, h)
             break -- nothing farther down a blocked corridor is visible
         end
@@ -256,10 +276,15 @@ local function buildVignetteMask(dither)
             local t = i / vignetteCfg.bands -- 1 (outer, stays near-black) down toward 0 (inner, near-white)
             local radius = hotspotRadius + (maxRadius - hotspotRadius) * t
             gfx.setColor(gfx.kColorWhite)
-            -- Direct grayscale (0=black, 1=white), same correction as
-            -- setWallDither -- outer band (t=1) should stay black, so it
-            -- needs the LOW end of the scale: 1 - t.
-            gfx.setDitherPattern(1 - t, gfx.image.kDitherTypeBayer8x8)
+            -- Same alpha direction as setSurfaceDither: 0 = opaque white,
+            -- 1 = transparent (shows this image's black background). The
+            -- outer band (t=1) should STAY the black background, i.e.
+            -- stay transparent, so it wants the HIGH end -- alpha = t
+            -- directly, not 1-t. (The previous 1-t here meant the mask
+            -- rendered almost entirely opaque white, so the vignette was
+            -- doing effectively nothing -- this is why the ring "went
+            -- away.")
+            gfx.setDitherPattern(t, gfx.image.kDitherTypeBayer8x8)
             gfx.fillCircleAtPoint(centerX, centerY, radius)
         end
         -- Guaranteed fully clear (solid white, no dithering) at the

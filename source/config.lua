@@ -107,6 +107,18 @@ Config.noise = {
     shovelDigNoise = 60,
 }
 
+-- === Materials ===
+-- Every map tile has its own intrinsic brightness -- a "color" simulated
+-- via dither density, independent of light. Invisible in the dark. Where
+-- light overlaps a tile, the tile's own brightness MULTIPLIES with the
+-- light's brightness (combined as real numbers, then dithered once) --
+-- that's what makes different materials read as reflecting the light
+-- differently instead of the flashlight painting everything flat white.
+Config.materials = {
+    floor = { dither = 0.85 }, -- bright, reflective ground
+    wall  = { dither = 0.30 }, -- dark, absorbs most light
+}
+
 -- === Movement ===
 -- D-pad, gradual tile-to-tile motion (not instant snapping). Left hand
 -- steers, right hand cranks -- deliberate, so neither input starves the
