@@ -6,9 +6,12 @@
 -- real hardware, before cave.lua adds more variables to test against.
 --
 -- Camera is first-person (see CLAUDE.md "Camera / rendering" section) --
--- not the top-down view this file started as. Movement is grid-based
--- and facing-relative: up/down step forward/backward, left/right turn
--- 90 degrees. Rendering is a nested-rectangle corridor perspective, not
+-- not the top-down view this file started as. Movement is grid-based and
+-- facing-relative, but NOT up-to-walk-forward: Left/Right alternate to
+-- crawl forward one tile at a time away from junctions, and become a
+-- sticky peek (committed via A) once there's an actual choice to make --
+-- see the === Player === comment block below for the full control
+-- breakdown. Rendering is a nested-rectangle corridor perspective, not
 -- true per-pixel raycasting -- a fixed, small number of draw calls per
 -- frame regardless of view distance, which is what keeps this cheap
 -- enough for Playdate's CPU budget.
@@ -58,16 +61,38 @@ local tileSize <const> = Config.movement.tileSize
 -- center over time -- this is what makes movement gradual instead of an
 -- instant snap, and it doubles as the camera's continuous depth position
 -- for rendering (see continuousDepthAt below).
--- facingDX/DY: unit vector, one of N/E/S/W. rightDX/DY: 90-degree
--- clockwise rotation of facing, used to find the tiles to either side.
+--
+-- facingDX/DY: the player's TRUE facing -- unit vector, one of N/E/S/W.
+--
+-- viewDX/DY + viewRightDX/DY: what's actually RENDERED this frame. Only
+-- diverges from facing while peeking at a junction (see updateMovement).
+--
+-- CONTROLS (see updateMovement for the actual logic):
+--   Away from a junction: Left/Right ALTERNATE to crawl forward one tile
+--   per tap -- press the same side twice in a row and the second tap
+--   does nothing, forcing left-right-left-right like actual crawling
+--   through a tight space, instead of a plain "move forward" button.
+--   At a junction (current tile has an open path to either side of
+--   facing): Left/Right instead PEEK -- one 90-degree rotation per tap,
+--   sticky, cumulative from whatever's currently being viewed, so
+--   repeated taps can look all the way around. A commits: turns the true
+--   facing to match the current view, then steps into it.
+--   Down: instant 180-degree turn-around, no step. This is now the only
+--   way to backtrack -- deliberate, not a free instant action.
 local player = {
     tileX = 2, tileY = 2,
     pixelX = 0, pixelY = 0,
     targetPixelX = 0, targetPixelY = 0,
     moving = false,
     facingDX = 1, facingDY = 0, -- start facing East
-    rightDX = 0, rightDY = 1,
+    viewDX = 1, viewDY = 0,
+    viewRightDX = 0, viewRightDY = 1,
 }
+
+-- Which side crawled last, so Left/Right can enforce alternation. Reset
+-- to nil (either side may lead) whenever the player enters a fresh
+-- stretch via a junction commit or a turn-around.
+local lastCrawlSide = nil
 
 local function tileToPixelCenter(tx, ty)
     return tx * tileSize + tileSize / 2, ty * tileSize + tileSize / 2
@@ -76,47 +101,139 @@ end
 player.pixelX, player.pixelY = tileToPixelCenter(player.tileX, player.tileY)
 player.targetPixelX, player.targetPixelY = player.pixelX, player.pixelY
 
-local function setFacing(dx, dy)
-    player.facingDX, player.facingDY = dx, dy
-    -- 90-degree clockwise rotation of facing, in screen space (y+ down).
-    player.rightDX, player.rightDY = -dy, dx
+-- 90-degree rotations of a facing vector, in screen space (y+ down).
+local function leftOf(dx, dy)
+    return dy, -dx
 end
 
-local function turnLeft()
-    if player.moving then return end
-    setFacing(player.facingDY, -player.facingDX) -- counter-clockwise
+local function rightOf(dx, dy)
+    return -dy, dx
 end
 
-local function turnRight()
-    if player.moving then return end
-    setFacing(-player.facingDY, player.facingDX) -- clockwise
+-- True when the player's CURRENT tile has an open path to either side of
+-- the true facing -- i.e. there's an actual choice to make here, not
+-- just one way forward. Checked against facing (not view) so peeking
+-- around doesn't change what counts as "at a junction."
+local function atJunction()
+    local rx, ry = rightOf(player.facingDX, player.facingDY)
+    local leftOpen = not isWall(player.tileX - rx, player.tileY - ry)
+    local rightOpen = not isWall(player.tileX + rx, player.tileY + ry)
+    return leftOpen or rightOpen
 end
 
--- Attempts to step forward (sign = 1) or backward (sign = -1) along the
--- direction faced. No-ops if already mid-move or the target tile is a
--- wall.
-local function tryStep(sign)
+-- The three directions peeking is allowed to land on, in left-to-right
+-- order, relative to true facing: [left, straight, right]. "Behind" is
+-- never in this list at all -- it's not a peek option, turning around is
+-- Down's job. Each slot is either {dx, dy} if that direction is open, or
+-- false if it's a wall -- so callers can skip closed slots without
+-- losing their place in the ordering.
+local function junctionOptions()
+    local lx, ly = leftOf(player.facingDX, player.facingDY)
+    local rx, ry = rightOf(player.facingDX, player.facingDY)
+    local options = { { lx, ly }, { player.facingDX, player.facingDY }, { rx, ry } }
+    for i, dir in ipairs(options) do
+        if isWall(player.tileX + dir[1], player.tileY + dir[2]) then
+            options[i] = false
+        end
+    end
+    return options
+end
+
+-- Index of the current view within `options`, or nil if the view isn't
+-- one of the three candidates (e.g. it's still sitting on the true
+-- facing and that happens to be a wall, as when a junction is first
+-- reached looking straight into a blocked passage).
+local function currentOptionIndex(options)
+    for i, dir in ipairs(options) do
+        if dir and dir[1] == player.viewDX and dir[2] == player.viewDY then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Attempts to step forward one tile along the TRUE facing. No-ops if
+-- already mid-move or the target tile is a wall.
+local function tryStep()
     if player.moving then return end
-    local nx = player.tileX + player.facingDX * sign
-    local ny = player.tileY + player.facingDY * sign
+    local nx = player.tileX + player.facingDX
+    local ny = player.tileY + player.facingDY
     if isWall(nx, ny) then return end
     player.tileX, player.tileY = nx, ny
     player.targetPixelX, player.targetPixelY = tileToPixelCenter(nx, ny)
     player.moving = true
 end
 
+-- Instant 180-degree turn -- no step. Guarded against mid-slide like
+-- every other facing change.
+local function turnAround()
+    if player.moving then return end
+    player.facingDX, player.facingDY = -player.facingDX, -player.facingDY
+    player.viewDX, player.viewDY = player.facingDX, player.facingDY
+    lastCrawlSide = nil -- fresh direction, either hand may lead
+end
+
+-- Turns the true facing to match whatever's currently being viewed, then
+-- attempts to step into it. The turn always takes; the step doesn't if
+-- the target tile is a wall (same rule tryStep always had).
+local function commitView()
+    player.facingDX, player.facingDY = player.viewDX, player.viewDY
+    tryStep()
+    lastCrawlSide = nil -- fresh direction, either hand may lead
+end
+
 local function updateMovement(dt)
-    if pd.buttonJustPressed(pd.kButtonLeft) then
-        turnLeft()
-    elseif pd.buttonJustPressed(pd.kButtonRight) then
-        turnRight()
+    if pd.buttonJustPressed(pd.kButtonDown) then
+        turnAround()
     end
 
-    if pd.buttonIsPressed(pd.kButtonUp) then
-        tryStep(1)
-    elseif pd.buttonIsPressed(pd.kButtonDown) then
-        tryStep(-1)
+    if atJunction() then
+        -- Peek: step through {left, straight, right} one OPEN option at
+        -- a time, skipping walls, clamped at the ends -- never wraps
+        -- onto a wall or onto "behind." No movement happens from
+        -- Left/Right here.
+        local peekLeft = pd.buttonJustPressed(pd.kButtonLeft)
+        local peekRight = pd.buttonJustPressed(pd.kButtonRight)
+        if peekLeft or peekRight then
+            local options = junctionOptions()
+            local idx = currentOptionIndex(options) or 2 -- default: straight
+            local from, to, step = idx + 1, 3, 1
+            if peekLeft then
+                from, to, step = idx - 1, 1, -1
+            end
+            for i = from, to, step do
+                if options[i] then
+                    player.viewDX, player.viewDY = options[i][1], options[i][2]
+                    break
+                end
+            end
+        end
+
+        -- A only ever moves the player IN CONJUNCTION with a junction --
+        -- it's the commit for a peek, not a general "move forward"
+        -- button. Gating it here (instead of unconditionally below)
+        -- keeps it from silently letting you skip the crawl alternation
+        -- in a plain corridor.
+        if pd.buttonJustPressed(pd.kButtonA) then
+            commitView()
+        end
+    else
+        -- Crawl: alternating taps advance one tile at a time. Repeating
+        -- the same side without alternating does nothing. A does
+        -- nothing here -- see the junction branch above.
+        if pd.buttonJustPressed(pd.kButtonLeft) and lastCrawlSide ~= "left" then
+            lastCrawlSide = "left"
+            tryStep()
+        elseif pd.buttonJustPressed(pd.kButtonRight) and lastCrawlSide ~= "right" then
+            lastCrawlSide = "right"
+            tryStep()
+        end
+        -- Not at a junction -- nothing to peek at, keep view synced to
+        -- facing so rendering doesn't stay stuck on a stale peek.
+        player.viewDX, player.viewDY = player.facingDX, player.facingDY
     end
+
+    player.viewRightDX, player.viewRightDY = rightOf(player.viewDX, player.viewDY)
 
     if player.moving then
         local step = Config.movement.moveSpeed * dt
@@ -151,11 +268,11 @@ end
 -- position. This is what makes forward/backward sliding animate the
 -- corridor smoothly rather than jumping a full tile at a time.
 local function continuousDepthAt(d)
-    local cx = player.tileX + player.facingDX * d
-    local cy = player.tileY + player.facingDY * d
+    local cx = player.tileX + player.viewDX * d
+    local cy = player.tileY + player.viewDY * d
     local camTileX = player.pixelX / tileSize
     local camTileY = player.pixelY / tileSize
-    return (cx - camTileX) * player.facingDX + (cy - camTileY) * player.facingDY
+    return (cx - camTileX) * player.viewDX + (cy - camTileY) * player.viewDY
 end
 
 -- Sets the fill color/dither for a surface at a given depth, combining
@@ -190,10 +307,10 @@ local function drawCorridor()
         if depth <= 0 then break end
 
         local x, y, w, h = rectForDepth(depth)
-        local cx = player.tileX + player.facingDX * d
-        local cy = player.tileY + player.facingDY * d
-        local leftWall = isWall(cx - player.rightDX, cy - player.rightDY)
-        local rightWall = isWall(cx + player.rightDX, cy + player.rightDY)
+        local cx = player.tileX + player.viewDX * d
+        local cy = player.tileY + player.viewDY * d
+        local leftWall = isWall(cx - player.viewRightDX, cy - player.viewRightDY)
+        local rightWall = isWall(cx + player.viewRightDX, cy + player.viewRightDY)
         local ahead = isWall(cx, cy)
 
         -- Floor and ceiling -- a separate axis from left/right/ahead, so
